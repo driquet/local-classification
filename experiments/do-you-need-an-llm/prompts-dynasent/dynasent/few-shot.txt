@@ -1,0 +1,7 @@
+What is the sentiment of the sentence?
+Answer with one word: {labels}.
+
+Examples:
+{examples}
+
+Sentence: {text}

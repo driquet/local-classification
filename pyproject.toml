@@ -1,0 +1,36 @@
+[project]
+name = "lc"
+version = "1.0.0"
+description = "Local text classification experiments: TF-IDF, fine-tuned encoders, prompted LLMs and decision models."
+authors = [{ name = "Damien Riquet", email = "d.riquet@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "huggingface-hub>=1.3.0",
+    "mlx-lm>=0.32.2",
+    "numpy>=2.5.4",
+    "pandas>=3.0.6",
+    "pyarrow>=26.0.0",
+    "scikit-learn>=1.9.1",
+    "torch>=2.14.1",
+    "transformers>=5.20.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=9.1.1", "ruff>=0.15.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: loads a model on the GPU (run with `pytest -m gpu`)"]
+addopts = "-m 'not gpu'"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]

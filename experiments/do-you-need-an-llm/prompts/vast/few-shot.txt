@@ -1,0 +1,7 @@
+What is the stance of the comment toward the topic?
+Answer with one word: {labels}.
+
+Examples:
+{examples}
+
+{text}

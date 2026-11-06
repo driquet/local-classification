@@ -1,0 +1,6 @@
+Classify the user message into one of these intents:
+{label_lines}
+
+Message: {text}
+
+Answer with the intent name only.
