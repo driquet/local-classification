@@ -18,7 +18,6 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import mlx.core as mx
 import numpy as np
 import pandas as pd
 
@@ -139,38 +138,59 @@ class DecisionPredictor:
         return probs[[order.index(label) for label in self.labels]]
 
 
+def tied_head_classes(config: dict) -> tuple:
+    from mlx_lm.utils import _get_classes
+
+    model_class, args_class = _get_classes(config)
+
+    class TiedHead(model_class):
+        def sanitize(self, weights):
+            # The checkpoint also stores the output head, an exact copy of the input embeddings,
+            # which the configuration ties. mlx-lm only drops that key under its inner name.
+            weights.pop("lm_head.weight", None)
+            return super().sanitize(weights)
+
+    return TiedHead, args_class
+
+
+def quantize(repo: str, revision: str, bits: int, out_dir: Path) -> None:
+    """Write ``bits``-bit weights of a pinned model to ``out_dir``, as ``mlx_lm.convert`` does."""
+    from huggingface_hub import snapshot_download
+    from mlx_lm.utils import load_model, load_tokenizer, quantize_model, save
+
+    path = Path(snapshot_download(repo, revision=revision))
+    model, config = load_model(path, lazy=True, get_model_classes=tied_head_classes)
+    model, config = quantize_model(model, config, 64, bits)
+    save(out_dir, path, model, load_tokenizer(path), config)
+
+
 class SlotScorer:
     """Next-token distribution over the slot tokens at the end of a request."""
 
     def __init__(self, repo: str, revision: str):
+        import mlx.core as mx
+        import mlx.nn as nn
         from huggingface_hub import snapshot_download
-        from mlx_lm.utils import _get_classes, load_model, load_tokenizer
+        from mlx_lm.utils import load_model, load_tokenizer
 
-        def classes(config):
-            model_class, args_class = _get_classes(config)
-
-            class TiedHead(model_class):
-                def sanitize(self, weights):
-                    # The checkpoint also stores the output head, an exact copy of the input embeddings,
-                    # which the configuration ties. mlx-lm only drops that key under its inner name.
-                    weights.pop("lm_head.weight", None)
-                    return super().sanitize(weights)
-
-            return TiedHead, args_class
-
-        path = Path(snapshot_download(repo, revision=revision))
-        self.model, _ = load_model(path, get_model_classes=classes)
+        path = Path(repo) if Path(repo).is_dir() else Path(snapshot_download(repo, revision=revision))
+        self.model, _ = load_model(path, get_model_classes=tied_head_classes)
         self.tokenizer = load_tokenizer(path)
         self.decoder = self.model.language_model.model  # the text decoder, up to its final norm
         ids = [self._single_token(label) for label in SLOT_LABELS]
         assert None not in ids and len(set(ids)) == len(ids), "slot labels must be distinct single tokens"
-        self.slot_weights = self.decoder.embed_tokens.weight[mx.array(ids)].astype(mx.float32)
+        embed, weight = self.decoder.embed_tokens, self.decoder.embed_tokens.weight
+        if isinstance(embed, nn.QuantizedEmbedding):
+            weight = mx.dequantize(weight, embed.scales, embed.biases, embed.group_size, embed.bits)
+        self.slot_weights = weight[mx.array(ids)].astype(mx.float32)
 
     def _single_token(self, label: str) -> int | None:
         ids = self.tokenizer.encode(label, add_special_tokens=False)
         return ids[0] if len(ids) == 1 and self.tokenizer.decode(ids) == label else None
 
     def score(self, chat: list[dict[str, str]], n_options: int) -> np.ndarray:
+        import mlx.core as mx
+
         text = self.tokenizer.apply_chat_template(
             chat, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )

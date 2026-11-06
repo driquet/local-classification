@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from lc import data
-from lc.measure import in_fresh_process
+from lc.measure import gpu_used_mb, in_fresh_process
 from lc.metrics import per_class_f1, scores
 from lc.models import Classifier
 
@@ -38,6 +38,7 @@ COLUMNS = [
     "train_peak_mb",
     "predict_s",
     "peak_mb",
+    "gpu_used_mb",
     "disk_mb",
     "n",
     "macro_f1",
@@ -88,10 +89,12 @@ def execute(
     runs_dir: Path,
     limit: int | None = None,
     data_dir: Path = data.DATA_DIR,
+    checkpoint: Path | None = None,
 ) -> dict | None:
     """Fit, predict, evaluate; returns the results row, or ``None`` if the table already has the run.
 
     ``limit`` scores the first ``limit`` test examples only, for a quick end-to-end check.
+    ``checkpoint`` keeps what ``fit`` wrote in that directory instead of a temporary one.
     """
     rid = run_id(run, classifier, limit, data_dir)
     if rid in completed(results_path):
@@ -103,11 +106,12 @@ def execute(
         test = test.head(limit)
 
     with tempfile.TemporaryDirectory() as tmp:
-        out_dir = Path(tmp)
+        out_dir = Path(checkpoint or tmp)
+        out_dir.mkdir(parents=True, exist_ok=True)
         (fit_s, train_n), train_peak_mb = in_fresh_process(
             _fit, classifier, run.task, train, labels, run.seed, out_dir
         )
-        (probs, latency_ms, predict_s), peak_mb = in_fresh_process(
+        (probs, latency_ms, predict_s, gpu_mb), peak_mb = in_fresh_process(
             _predict, classifier, out_dir, test["text"].tolist()
         )
         disk_mb = classifier.disk_mb(out_dir)
@@ -128,6 +132,7 @@ def execute(
         "train_peak_mb": train_peak_mb,
         "predict_s": round(predict_s, 2),
         "peak_mb": peak_mb,
+        "gpu_used_mb": gpu_mb,
         "disk_mb": disk_mb,
         **evaluate(test["label"], labels, probs, latency_ms),
     }
@@ -155,7 +160,8 @@ def _predict(classifier: Classifier, out_dir: Path, texts: list[str]):
         latency_ms.append((time.perf_counter() - tick) * 1000)
         if i % 500 == 0:
             print(f"    {i}/{len(texts)}", flush=True)
-    return np.array(probs), latency_ms, time.perf_counter() - start
+    elapsed = time.perf_counter() - start
+    return np.array(probs), latency_ms, elapsed, gpu_used_mb()  # while the predictor still holds its weights
 
 
 def validate(probs: np.ndarray, n_texts: int, n_labels: int, tolerance: float = 1e-3) -> np.ndarray:
@@ -201,6 +207,12 @@ def append_row(row: dict, results_path: Path) -> None:
     results_path = Path(results_path)
     results_path.parent.mkdir(parents=True, exist_ok=True)
     new = not results_path.exists()
+    if not new:
+        with results_path.open(newline="") as f:
+            outdated = next(csv.reader(f)) != COLUMNS
+        if outdated:  # a table written before a column was added: rewrite it with the new columns, empty
+            old = pd.read_csv(results_path, dtype=str, keep_default_na=False)
+            old.reindex(columns=COLUMNS, fill_value="").to_csv(results_path, index=False)
     with results_path.open("a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=COLUMNS)
         if new:

@@ -17,6 +17,7 @@ ModernBERT's architecture and training recipe). Two details matter more than the
 
 import json
 import math
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -26,7 +27,7 @@ import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 from transformers.utils import logging as transformers_logging
 
-from lc.measure import disk_mb
+from lc.measure import disk_mb, in_ram
 
 DEVICE = "mps"
 # Loading a pretrained encoder with a new classification head reports the head's weights as missing,
@@ -46,9 +47,15 @@ class FineTunedEncoder:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     max_length: int = 512
+    # Recompute each layer's activations in the backward pass instead of keeping them: same updates, about a
+    # third more time, a fraction of the memory. Ettin-400M needs it to train on VAST in 24 GB.
+    gradient_checkpointing: bool = False
 
     def identity(self) -> dict:
-        return {"approach": "fine-tuned-encoder", **asdict(self)}
+        fields = asdict(self)
+        if not self.gradient_checkpointing:  # absent from older runs' identities, which keep their run ids
+            del fields["gradient_checkpointing"]
+        return {"approach": "fine-tuned-encoder", **fields}
 
     def fit(self, task: str, train: pd.DataFrame, labels: list[str], seed: int, out_dir: Path) -> int:
         torch.manual_seed(seed)
@@ -60,6 +67,8 @@ class FineTunedEncoder:
             id2label=dict(enumerate(labels)),
             label2id={label: i for i, label in enumerate(labels)},
         ).to(DEVICE)
+        if self.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
         texts = train["text"].tolist()
         targets = torch.tensor([labels.index(label) for label in train["label"]])
         total_steps = max(self.epochs * math.ceil(len(texts) / self.batch_size), self.min_steps)
@@ -89,6 +98,10 @@ class FineTunedEncoder:
                 schedule.step()
                 optimizer.zero_grad()
                 step += 1
+                # Batches padded to their own length leave odd-sized blocks in the MPS cache, which grows
+                # until the machine swaps on long texts (VAST): release it now and then.
+                if step % 50 == 0:
+                    torch.mps.empty_cache()
                 if step % 200 == 0:
                     print(f"    step {step}/{total_steps}, loss {loss.item():.3f}", flush=True)
                 if step == total_steps:
@@ -106,14 +119,56 @@ class FineTunedEncoder:
         return disk_mb(out_dir)
 
 
+@dataclass(frozen=True)
+class ServedEncoder:
+    """A fine-tuned checkpoint served another way: other device, thread count or precision.
+
+    ``fit`` trains nothing. It takes the checkpoint of the same task and seed under ``checkpoints``, so
+    every variant of a model shares its weights and only the serving differs.
+    """
+
+    base: FineTunedEncoder
+    checkpoints: str
+    device: str = DEVICE
+    threads: int | None = None
+    half: bool = False
+
+    def identity(self) -> dict:
+        return {
+            "approach": "served-encoder",
+            "base": self.base.identity(),
+            "device": self.device,
+            "threads": self.threads,
+            "half": self.half,
+        }
+
+    def fit(self, task: str, train: pd.DataFrame, labels: list[str], seed: int, out_dir: Path) -> int:
+        shutil.copytree(Path(self.checkpoints) / task / f"seed-{seed}", out_dir, dirs_exist_ok=True)
+        if self.half:
+            AutoModelForSequenceClassification.from_pretrained(out_dir).half().save_pretrained(out_dir)
+        return len(train)
+
+    def load(self, out_dir: Path) -> "EncoderPredictor":
+        if self.threads:
+            torch.set_num_threads(self.threads)
+        return EncoderPredictor(out_dir, self.base.max_length, self.device, self.half)
+
+    def disk_mb(self, out_dir: Path) -> float:
+        return disk_mb(out_dir)
+
+
 class EncoderPredictor:
-    def __init__(self, model_dir: Path, max_length: int):
+    def __init__(self, model_dir: Path, max_length: int, device: str = DEVICE, half: bool = False):
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_dir).to(DEVICE).eval()
-        self.max_length = max_length
+        options = {"dtype": torch.float16} if half else {}
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_dir, **options)
+        self.model = self.model.to(device).eval()
+        if device == "cpu":
+            in_ram(self.model)
+        self.max_length, self.device = max_length, device
 
     @torch.inference_mode()
     def predict(self, text: str) -> np.ndarray:
         encoded = self.tokenizer([text], truncation=True, max_length=self.max_length, return_tensors="pt")
-        logits = self.model(**encoded.to(DEVICE)).logits[0].float()
+        logits = self.model(**encoded.to(self.device)).logits[0].float()
         return torch.softmax(logits, dim=-1).cpu().numpy()

@@ -20,11 +20,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import mlx.core as mx
 import numpy as np
 import pandas as pd
-from mlx_lm import load
-from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache
 
 from lc import data
 from lc.measure import disk_mb
@@ -124,6 +121,8 @@ class LabelScorer:
     """Probability of each label as the complete answer of the assistant turn (thinking off)."""
 
     def __init__(self, repo: str, revision: str):
+        from mlx_lm import load
+
         self.model, self.tokenizer = load(repo, revision=revision)
         self.end_of_turn = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
         self._label_ids: dict[tuple[str, ...], list[list[int]]] = {}
@@ -152,8 +151,11 @@ class LabelScorer:
         back to an earlier position. A prompt whose tokens differ inside the prefix (the text merging with
         the token before it, say) is therefore encoded in full rather than trimmed.
         """
+        import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache
+
         ids = [self.prompt_ids(m) for m in messages]
-        n = _common_prefix_length(ids)
+        n = common_prefix_length(ids)
         self._prefix, self._prefix_cache = ids[0][:n], make_prompt_cache(self.model)
         if n:
             mx.eval(self.model(mx.array([self._prefix]), cache=self._prefix_cache))
@@ -167,6 +169,9 @@ class LabelScorer:
         return probs / probs.sum()
 
     def _cached(self, prompt: list[int], label_ids: list[list[int]]) -> np.ndarray:
+        import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache
+
         n = len(self._prefix)
         if 0 < n < len(prompt) and prompt[:n] == self._prefix:
             cache, start = _copy_cache(self._prefix_cache), n
@@ -196,6 +201,8 @@ class LabelScorer:
 
     def _uncached(self, prompt: list[int], label_ids: list[list[int]]) -> np.ndarray:
         """Reference implementation: one full forward pass per label, no cache."""
+        import mlx.core as mx
+
         scores = []
         for ids in label_ids:
             logits = self.model(mx.array([prompt + ids[:-1]]))[0, len(prompt) - 1 :].astype(mx.float32)
@@ -204,10 +211,38 @@ class LabelScorer:
         return np.array(scores)
 
 
+@dataclass(frozen=True)
+class OnCpu:
+    """A 4B classifier on MLX, run on the CPU instead of the GPU.
+
+    The device is set where the model loads, in the predicting process. MLX's CPU code for quantized
+    weights is slow (minutes per text in 4 bits), so quantized runs score a handful of texts only.
+    """
+
+    inner: "PromptedLLM | DecisionModel"  # noqa: F821
+
+    def identity(self) -> dict:
+        return {**self.inner.identity(), "device": "cpu"}
+
+    def fit(self, task: str, train: pd.DataFrame, labels: list[str], seed: int, out_dir: Path) -> int:
+        return self.inner.fit(task, train, labels, seed, out_dir)
+
+    def load(self, out_dir: Path):
+        import mlx.core as mx
+
+        mx.set_default_device(mx.cpu)
+        return self.inner.load(out_dir)
+
+    def disk_mb(self, out_dir: Path) -> float:
+        return self.inner.disk_mb(out_dir)
+
+
 def model_disk_mb(repo: str, revision: str) -> float:
     """Size of the model files in the local Hugging Face cache (weights, config and tokenizer)."""
     from huggingface_hub import try_to_load_from_cache
 
+    if Path(repo).is_dir():
+        return disk_mb(Path(repo))
     return disk_mb(Path(try_to_load_from_cache(repo, "config.json", revision=revision)).parent)
 
 
@@ -215,7 +250,7 @@ def _dataset(task: str) -> str:
     return task.split("-")[0]
 
 
-def _common_prefix_length(sequences: list[list[int]]) -> int:
+def common_prefix_length(sequences: list[list[int]]) -> int:
     n = 0
     for column in zip(*sequences, strict=False):
         if len(set(column)) > 1:
@@ -227,6 +262,8 @@ def _common_prefix_length(sequences: list[list[int]]) -> int:
 def _copy_cache(cache: list) -> list:
     """An independent copy of a prompt cache. Key and value arrays are sliced to their length, so the copy
     reallocates on its first update instead of writing into arrays the original shares."""
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
     copy = [KVCache() if isinstance(c, KVCache) else ArraysCache(len(c.cache)) for c in cache]
     for original, new in zip(cache, copy, strict=True):
         if isinstance(original, KVCache):
@@ -239,6 +276,9 @@ def _copy_cache(cache: list) -> list:
 
 def _repeat_cache(cache: list, n: int) -> None:
     """Turn a batch-1 cache into a batch-n cache, one copy per label of a chunk."""
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache
+
     for c in cache:
         if isinstance(c, KVCache):
             keys, values = c.keys_and_values()

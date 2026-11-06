@@ -43,6 +43,31 @@ def peak_memory_mb() -> float:
     return info[2 + 28] / 2**20  # ri_lifetime_max_phys_footprint
 
 
+def in_ram(model):
+    """Copy a PyTorch model's weights into the process's own memory, and return the model.
+
+    Weights loaded from safetensors stay mapped from the file, and the physical footprint leaves such
+    file-backed pages out: a 575 MB model served on the CPU counted as almost nothing. A copy makes the
+    weights count, as they do in any server that holds its model in RAM. (On the GPU the weights are copied
+    to Metal buffers anyway, which the footprint counts.)
+    """
+    for parameter in model.parameters():
+        parameter.data = parameter.data.clone()
+    return model
+
+
+def gpu_used_mb() -> float | None:
+    """Memory held by live tensors on the GPU, if PyTorch is loaded; ``None`` otherwise.
+
+    PyTorch reserves GPU memory in large blocks, and the physical footprint counts whole blocks: about
+    1.5 GB for any model from 17M to 150M parameters. This is what the model and its tensors actually use.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.backends.mps.is_available():
+        return None
+    return round(torch.mps.current_allocated_memory() / 2**20, 1)
+
+
 def disk_mb(path: Path) -> float:
     """Total size of the files under ``path`` (symbolic links followed, as in a Hugging Face cache)."""
     return round(sum(f.stat().st_size for f in Path(path).rglob("*") if f.is_file()) / 2**20, 1)
