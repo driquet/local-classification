@@ -1,3 +1,4 @@
+import pandas as pd
 import pytest
 
 from lc import data
@@ -57,3 +58,19 @@ def test_an_intent_has_the_same_few_shot_example_in_every_slice(data_dir):
     assert len(full) == 151 and OUT_OF_SCOPE in set(full["label"])
     assert sorted(sliced["label"]) == data.labels(slice_name(10, 0), data_dir)
     assert set(sliced["id"]) == set(full[full["label"].isin(sliced["label"])]["id"])
+
+
+def test_teacher_probabilities_survive_freezing(tmp_path):
+    df = pd.DataFrame(
+        {"id": ["a", "b"], "text": ["x", "y"], "label": ["p", "q"], "probs": [[0.9, 0.1], [0.3, 0.7]]}
+    )
+    data.write_task(tmp_path / "silver", {"train": df}, ["p", "q"], {})
+    assert data.load("silver", "train", tmp_path)["probs"].tolist() == [[0.9, 0.1], [0.3, 0.7]]
+
+
+def test_distillation_fields_keep_old_run_ids_and_are_recorded():
+    from lc.models.encoder import FineTunedEncoder
+
+    assert not {"soft", "temperature", "accumulation"} & set(FineTunedEncoder("r", "v").identity())
+    identity = FineTunedEncoder("r", "v", soft=True, temperature=2.0, accumulation=4).identity()
+    assert (identity["soft"], identity["temperature"], identity["accumulation"]) == (True, 2.0, 4)

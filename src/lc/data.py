@@ -13,6 +13,8 @@ Tasks:
 - ``clinc150-k<n>-c<chain>``: CLINC150 restricted to ``n`` in-scope intents. A chain is one seeded random
   order of the 150 intents, and a slice keeps the first ``n``, so within a chain every slice contains the
   smaller ones. Out-of-scope examples are dropped, so the class count is the only thing that changes.
+- ``arxiv``: primary category of an arXiv paper (eight CS categories), from its title and abstract. Papers
+  first submitted from March to October 2026, after Qwen3.5 (the base of most teachers) came out.
 """
 
 import functools
@@ -47,6 +49,24 @@ CLINC150 = "clinc150"
 OUT_OF_SCOPE = "oos"
 # Class count -> chains. Small slices depend most on which intents are drawn, so they get three chains.
 CLASS_SLICES = {10: (0, 1, 2), 25: (0, 1, 2), 50: (0,), 100: (0,)}
+
+ARXIV_REVISION = "c428226b689a0e17db2cd55265133b9eca15d97f"
+ARXIV_REPO = "datasets/librarian-bots/arxiv-metadata-snapshot"
+# Primary category -> the name the decision models see as an option.
+ARXIV_CATEGORIES = {
+    "cs.CL": "Computation and Language (NLP)",
+    "cs.CV": "Computer Vision",
+    "cs.LG": "Machine Learning",
+    "cs.CR": "Cryptography and Security",
+    "cs.RO": "Robotics",
+    "cs.SE": "Software Engineering",
+    "cs.HC": "Human-Computer Interaction",
+    "cs.IR": "Information Retrieval",
+}
+# arXiv ids start with the year and month of the first version: 2603 is March 2026. October is the snapshot's
+# last full month, and the upper bound is excluded.
+ARXIV_MONTHS = ("2603", "2611")
+ARXIV_SPLITS = {"test": 250, "validation": 125, "train": 1000}  # per category
 
 Splits = dict[str, pd.DataFrame]
 
@@ -123,6 +143,55 @@ def build_clinc150() -> tuple[Splits, list[str], dict]:
     return splits, sorted(intents), source
 
 
+def build_arxiv() -> tuple[Splits, list[str], dict]:
+    """Title and abstract; the label is the primary category, the first of ``categories``.
+
+    Withdrawn papers are dropped. Each category is shuffled with seed 0, then cut into test, validation and
+    training pool, in that order. cs.DB, the original eighth category, has about 900 papers in the window:
+    too few, so cs.IR replaces it.
+    """
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfFileSystem
+
+    fs = HfFileSystem()
+    files = sorted(fs.glob(f"{ARXIV_REPO}@{ARXIV_REVISION}/data/*.parquet"))
+    columns = ["id", "title", "abstract", "categories", "comments"]
+    window = [("id", ">=", ARXIV_MONTHS[0]), ("id", "<", ARXIV_MONTHS[1])]
+    df = pd.concat(pq.read_table(fs.open(f), columns=columns, filters=window).to_pandas() for f in files)
+    df = df[df["id"].str.fullmatch(r"\d{4}\.\d{4,5}")]
+    withdrawn = df["comments"].fillna("").str.contains("withdrawn", case=False) | df["abstract"].str.contains(
+        "this paper has been withdrawn", case=False
+    )
+    df = df[~withdrawn].drop_duplicates("id")
+    df = df.assign(
+        label=df["categories"].str.split().str[0], cross=df["categories"].str.split().str.len() > 1
+    )
+    df = df[df["label"].isin(ARXIV_CATEGORIES)]
+    clean = lambda s: " ".join(s.split())  # noqa: E731
+    df["text"] = [f"{clean(t)}\n{clean(a)}" for t, a in zip(df["title"], df["abstract"], strict=True)]
+    splits = {name: [] for name in ARXIV_SPLITS}
+    available = df["label"].value_counts().to_dict()
+    for label in ARXIV_CATEGORIES:
+        group = df[df["label"] == label].sort_values("id")
+        assert len(group) >= sum(ARXIV_SPLITS.values()), f"{label}: only {len(group)} papers"
+        group = group.iloc[np.random.default_rng(0).permutation(len(group))]
+        start = 0
+        for name, n in ARXIV_SPLITS.items():
+            splits[name].append(group.iloc[start : start + n])
+            start += n
+    splits = {name: pd.concat(parts) for name, parts in splits.items()}
+    picked = pd.concat(splits.values())
+    source = {
+        "url": f"https://huggingface.co/{ARXIV_REPO}",
+        "revision": ARXIV_REVISION,
+        "months": list(ARXIV_MONTHS),
+        "licence": "CC0 (metadata)",
+        "available": {label: int(available.get(label, 0)) for label in ARXIV_CATEGORIES},
+        "cross_listed": round(float(picked["cross"].mean()), 4),
+    }
+    return {name: d[["id", "text", "label"]] for name, d in splits.items()}, list(ARXIV_CATEGORIES), source
+
+
 def class_order(intents: list[str], chain: int) -> list[str]:
     """The chain's seeded random order of the intents (chain c uses seed c)."""
     return [intents[i] for i in np.random.default_rng(chain).permutation(len(intents))]
@@ -154,6 +223,7 @@ BUILDERS: dict[str, Callable[[], tuple[Splits, list[str], dict]]] = {
     "vast": build_vast,
     "dynasent": build_dynasent,
     CLINC150: build_clinc150,
+    "arxiv": build_arxiv,
     **{slice_name(n, c): _slice_builder(n, c) for n, chains in CLASS_SLICES.items() for c in chains},
 }
 
@@ -173,7 +243,8 @@ def write_task(task_dir: Path, splits: Splits, labels: list[str], source: dict) 
         unknown = set(df["label"]) - set(labels)
         assert not unknown, f"{name}: labels missing from the label list: {sorted(unknown)}"
         path = task_dir / f"{name}.jsonl"
-        rows = df.sort_values("id")[["id", "text", "label"]].to_dict("records")
+        columns = ["id", "text", "label"] + (["probs"] if "probs" in df else [])  # a teacher's, if any
+        rows = df.sort_values("id")[columns].to_dict("records")
         path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
         manifest["splits"][name] = {"n": len(rows), "sha256": _sha256(path)}
     (task_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

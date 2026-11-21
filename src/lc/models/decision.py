@@ -81,6 +81,13 @@ def request(task: str, text: str, labels: list[str]) -> tuple[str, list[tuple[st
         instructions = f"Sentence: {text}\nDetermine the sentiment of the sentence."
         keys = [chr(65 + i) for i in range(len(labels))]
         return instructions, list(zip(keys, labels, strict=True)), list(labels)
+    if task.startswith("arxiv"):
+        title, _, abstract = text.partition("\n")
+        instructions = (
+            f"Title: {title}\nAbstract: {abstract}\nWhich arXiv category is this paper's primary one?"
+        )
+        options = [(chr(65 + i), data.ARXIV_CATEGORIES[label]) for i, label in enumerate(labels)]
+        return instructions, options, list(labels)
     if task == data.CLINC150:
         head = "Classify the intent of this user request, or choose out of scope if none applies:\n"
     else:

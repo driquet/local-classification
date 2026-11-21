@@ -50,11 +50,19 @@ class FineTunedEncoder:
     # Recompute each layer's activations in the backward pass instead of keeping them: same updates, about a
     # third more time, a fraction of the memory. Ettin-400M needs it to train on VAST in 24 GB.
     gradient_checkpointing: bool = False
+    # Distillation: learn a teacher's probabilities (the training set's ``probs`` column) instead of its
+    # labels, with the KL divergence between both, softened by ``temperature`` and scaled by its square
+    # (Hinton et al., 2015). The teacher returns probabilities, not logits: softening raises them to 1/T.
+    soft: bool = False
+    temperature: float = 1.0
+    # Split each batch into this many parts, one forward and backward pass each, and update once: the same
+    # update as the whole batch, for a fraction of the activation memory. 512-token abstracts need it.
+    accumulation: int = 1
 
     def identity(self) -> dict:
-        fields = asdict(self)
-        if not self.gradient_checkpointing:  # absent from older runs' identities, which keep their run ids
-            del fields["gradient_checkpointing"]
+        # Fields added after the first runs are left out at their default, so those runs keep their ids.
+        late = {"gradient_checkpointing": False, "soft": False, "temperature": 1.0, "accumulation": 1}
+        fields = {k: v for k, v in asdict(self).items() if k not in late or v != late[k]}
         return {"approach": "fine-tuned-encoder", **fields}
 
     def fit(self, task: str, train: pd.DataFrame, labels: list[str], seed: int, out_dir: Path) -> int:
@@ -70,7 +78,12 @@ class FineTunedEncoder:
         if self.gradient_checkpointing:
             model.gradient_checkpointing_enable()
         texts = train["text"].tolist()
-        targets = torch.tensor([labels.index(label) for label in train["label"]])
+        if self.soft:
+            teacher = torch.tensor(np.stack(train["probs"].to_numpy()), dtype=torch.float32)
+            teacher = teacher ** (1 / self.temperature)
+            targets = teacher / teacher.sum(dim=1, keepdim=True)
+        else:
+            targets = torch.tensor([labels.index(label) for label in train["label"]])
         total_steps = max(self.epochs * math.ceil(len(texts) / self.batch_size), self.min_steps)
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
@@ -84,15 +97,10 @@ class FineTunedEncoder:
             order = rng.permutation(len(texts))
             for start in range(0, len(order), self.batch_size):
                 ids = order[start : start + self.batch_size]
-                encoded = tokenizer(
-                    [texts[i] for i in ids],
-                    truncation=True,
-                    max_length=self.max_length,
-                    padding=True,
-                    return_tensors="pt",
-                ).to(DEVICE)
-                loss = model(**encoded, labels=targets[ids].to(DEVICE)).loss
-                loss.backward()
+                size = math.ceil(len(ids) / self.accumulation)
+                for part in (ids[i : i + size] for i in range(0, len(ids), size)):
+                    loss = self._loss(model, tokenizer, [texts[i] for i in part], targets[part])
+                    (loss * len(part) / len(ids)).backward()  # weighted: the mean over the whole batch
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.max_grad_norm)
                 optimizer.step()
                 schedule.step()
@@ -111,6 +119,17 @@ class FineTunedEncoder:
         tokenizer.save_pretrained(out_dir)
         (out_dir / "labels.json").write_text(json.dumps(labels))
         return len(train)
+
+    def _loss(self, model, tokenizer, texts: list[str], targets: torch.Tensor) -> torch.Tensor:
+        """Mean loss over ``texts``: cross-entropy on labels, or softened KL on a teacher's probabilities."""
+        encoded = tokenizer(
+            texts, truncation=True, max_length=self.max_length, padding=True, return_tensors="pt"
+        ).to(DEVICE)
+        if not self.soft:
+            return model(**encoded, labels=targets.to(DEVICE)).loss
+        t = self.temperature
+        log_student = torch.log_softmax(model(**encoded).logits / t, dim=-1)
+        return torch.nn.functional.kl_div(log_student, targets.to(DEVICE), reduction="batchmean") * (t * t)
 
     def load(self, out_dir: Path) -> "EncoderPredictor":
         return EncoderPredictor(out_dir, self.max_length)
